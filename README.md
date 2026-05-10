@@ -5,7 +5,7 @@ GitHub integration for Kestrel Sovereign agents — manage issues, pull requests
 ## Installation
 
 ```bash
-uv pip install git+https://github.com/KestrelSovereignAI/kestrel-feature-github.git
+uv pip install kestrel-feature-github
 ```
 
 ## Dependencies
@@ -30,6 +30,6 @@ See [SKILL.md](SKILL.md) for the full skill reference.
 ## Development
 
 ```bash
-uv pip install kestrel-sovereign-sdk && uv pip install -e ".[test]"
-uv run pytest
+uv sync --extra test
+uv run --extra test pytest
 ```
