@@ -7,6 +7,7 @@ import yaml
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from .ast_analyzer import ASTAnalyzer
 from .cache import GitHubCache
@@ -90,7 +91,7 @@ class GitHubFeature(Feature):
         repo: str,
         path: str,
         ref: str = "main",
-    ) -> str:
+    ) -> ToolResult:
         """Read a file from GitHub.
 
         Args:
@@ -108,16 +109,22 @@ class GitHubFeature(Feature):
         # Check cache first
         cached = await self.cache.get(repo, path, ref)
         if cached:
-            return f"# {path} (cached)\n\n{cached.content}"
+            return ToolResult.ok(
+                f"# {path} (cached)\n\n{cached.content}",
+                data={"repo": repo, "path": path, "ref": ref, "cached": True},
+            )
 
         # Fetch from GitHub
         try:
             content = await self.client.get_file_content(repo, path, ref)
             # Cache it
             await self.cache.set(content)
-            return f"# {path}\n\n{content.content}"
+            return ToolResult.ok(
+                f"# {path}\n\n{content.content}",
+                data={"repo": repo, "path": path, "ref": ref, "cached": False},
+            )
         except GitHubClientError as e:
-            return f"Error reading {path}: {e}"
+            return ToolResult.failed(error=f"Error reading {path}: {e}")
 
     @tool(
         name="list_github_files",
@@ -130,7 +137,7 @@ class GitHubFeature(Feature):
         path: str = "",
         ref: str = "main",
         recursive: bool = False,
-    ) -> str:
+    ) -> ToolResult:
         """List files in a directory.
 
         Args:
@@ -165,9 +172,12 @@ class GitHubFeature(Feature):
                     size = f"{f.size:,}" if f.size else "?"
                     lines.append(f"\U0001f4c4 {f.path} ({size} bytes)")
 
-            return "\n".join(lines)
+            return ToolResult.ok(
+                "\n".join(lines),
+                data={"repo": repo, "path": path, "ref": ref, "count": len(files)},
+            )
         except GitHubClientError as e:
-            return f"Error listing {path}: {e}"
+            return ToolResult.failed(error=f"Error listing {path}: {e}")
 
     @tool(
         name="search_github_code",
@@ -181,7 +191,7 @@ class GitHubFeature(Feature):
         path: Optional[str] = None,
         extension: Optional[str] = None,
         max_results: int = 20,
-    ) -> str:
+    ) -> ToolResult:
         """Search for code in GitHub.
 
         Args:
@@ -203,7 +213,10 @@ class GitHubFeature(Feature):
             )
 
             if not results:
-                return f"No results found for: {query}"
+                return ToolResult.ok(
+                    f"No results found for: {query}",
+                    data={"query": query, "count": 0},
+                )
 
             lines = [f"# Search results for: {query}\n"]
 
@@ -217,9 +230,12 @@ class GitHubFeature(Feature):
                     if fragment:
                         lines.append(f"\n```\n{fragment}\n```")
 
-            return "\n".join(lines)
+            return ToolResult.ok(
+                "\n".join(lines),
+                data={"query": query, "count": len(results)},
+            )
         except GitHubClientError as e:
-            return f"Search error: {e}"
+            return ToolResult.failed(error=f"Search error: {e}")
 
     @tool(
         name="get_code_definition",
@@ -232,7 +248,7 @@ class GitHubFeature(Feature):
         path: str,
         name: str,
         ref: str = "main",
-    ) -> str:
+    ) -> ToolResult:
         """Get a specific function or class definition.
 
         Args:
@@ -249,7 +265,7 @@ class GitHubFeature(Feature):
             ref = GITHUB_DEFAULT_BRANCH
 
         if not path.endswith(".py"):
-            return "Error: AST analysis only supports Python files (.py)"
+            return ToolResult.failed(error="AST analysis only supports Python files (.py)")
 
         # Get file content
         try:
@@ -261,7 +277,7 @@ class GitHubFeature(Feature):
                 await self.cache.set(file_content)
                 content = file_content.content
         except GitHubClientError as e:
-            return f"Error reading {path}: {e}"
+            return ToolResult.failed(error=f"Error reading {path}: {e}")
 
         # Parse and find definition
         analyzer = ASTAnalyzer(content, path)
@@ -271,9 +287,13 @@ class GitHubFeature(Feature):
             # List available definitions
             all_defs = analyzer.get_definitions()
             available = [d.name for d in all_defs[:20]]
-            return f"Definition '{name}' not found in {path}.\n\nAvailable: {', '.join(available)}"
+            return ToolResult.ok(
+                f"Definition '{name}' not found in {path}.\n\nAvailable: {', '.join(available)}",
+                data={"repo": repo, "path": path, "name": name, "found": False, "available": available},
+            )
 
-        return f"""# {defn.type.title()}: {defn.name}
+        return ToolResult.ok(
+            f"""# {defn.type.title()}: {defn.name}
 
 **File:** {path}
 **Lines:** {defn.start_line}-{defn.end_line}
@@ -285,7 +305,17 @@ class GitHubFeature(Feature):
 ## Source
 ```python
 {defn.source}
-```"""
+```""",
+            data={
+                "repo": repo,
+                "path": path,
+                "name": defn.name,
+                "type": defn.type,
+                "start_line": defn.start_line,
+                "end_line": defn.end_line,
+                "found": True,
+            },
+        )
 
     @tool(
         name="list_code_definitions",
@@ -297,7 +327,7 @@ class GitHubFeature(Feature):
         repo: str,
         path: str,
         ref: str = "main",
-    ) -> str:
+    ) -> ToolResult:
         """List all definitions in a Python file.
 
         Args:
@@ -313,7 +343,7 @@ class GitHubFeature(Feature):
             ref = GITHUB_DEFAULT_BRANCH
 
         if not path.endswith(".py"):
-            return "Error: AST analysis only supports Python files (.py)"
+            return ToolResult.failed(error="AST analysis only supports Python files (.py)")
 
         # Get file content
         try:
@@ -325,14 +355,17 @@ class GitHubFeature(Feature):
                 await self.cache.set(file_content)
                 content = file_content.content
         except GitHubClientError as e:
-            return f"Error reading {path}: {e}"
+            return ToolResult.failed(error=f"Error reading {path}: {e}")
 
         # Parse
         analyzer = ASTAnalyzer(content, path)
         definitions = analyzer.get_definitions()
 
         if not definitions:
-            return f"No function or class definitions found in {path}"
+            return ToolResult.ok(
+                f"No function or class definitions found in {path}",
+                data={"repo": repo, "path": path, "count": 0},
+            )
 
         lines = [f"# Definitions in {path}\n"]
 
@@ -358,14 +391,24 @@ class GitHubFeature(Feature):
             if len(methods) > 30:
                 lines.append(f"  ... and {len(methods) - 30} more")
 
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={
+                "repo": repo,
+                "path": path,
+                "count": len(definitions),
+                "classes": len(classes),
+                "functions": len(functions),
+                "methods": len(methods),
+            },
+        )
 
     @tool(
         name="get_self_repo_info",
         description="Get information about the agent's own source repository.",
         category=ToolCategory.DATA_ACCESS,
     )
-    async def get_self_repo_info(self) -> str:
+    async def get_self_repo_info(self) -> ToolResult:
         """Get info about the agent's own repository.
 
         Returns:
@@ -376,7 +419,8 @@ class GitHubFeature(Feature):
         try:
             info = await self.client.get_repo_info(repo)
 
-            return f"""# Agent Source Repository
+            return ToolResult.ok(
+                f"""# Agent Source Repository
 
 **Repository:** {info.get('full_name')}
 **Description:** {info.get('description', 'N/A')}
@@ -392,16 +436,24 @@ class GitHubFeature(Feature):
 - Open Issues: {info.get('open_issues_count', 0)}
 - Last Updated: {info.get('updated_at', 'unknown')}
 
-Use `list_source_components` to see the feature components that make up this agent."""
+Use `list_source_components` to see the feature components that make up this agent.""",
+                data={
+                    "repo": info.get("full_name", repo),
+                    "default_branch": info.get("default_branch"),
+                    "visibility": info.get("visibility"),
+                    "open_issues_count": info.get("open_issues_count"),
+                    "url": info.get("html_url"),
+                },
+            )
         except GitHubClientError as e:
-            return f"Error getting repo info: {e}"
+            return ToolResult.failed(error=f"Error getting repo info: {e}")
 
     @tool(
         name="list_source_components",
         description="List all feature components in the agent's source code with their manifests.",
         category=ToolCategory.DATA_ACCESS,
     )
-    async def list_source_components(self, include_files: bool = False) -> str:
+    async def list_source_components(self, include_files: bool = False) -> ToolResult:
         """List all feature components.
 
         Args:
@@ -417,7 +469,7 @@ Use `list_source_components` to see the feature components that make up this age
         try:
             files = await self.client.list_directory(repo, GITHUB_SELF_FEATURES_ROOT, ref)
         except GitHubClientError as e:
-            return f"Could not access features directory: {e}"
+            return ToolResult.failed(error=f"Could not access features directory: {e}")
 
         components = []
 
@@ -477,7 +529,10 @@ Use `list_source_components` to see the feature components that make up this age
                 if len(comp["files"]) > 20:
                     lines.append(f"  ... and {len(comp['files']) - 20} more")
 
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={"repo": repo, "component_count": len(components)},
+        )
 
     @tool(
         name="get_component_source",
@@ -488,7 +543,7 @@ Use `list_source_components` to see the feature components that make up this age
         self,
         component: str,
         include_content: bool = False,
-    ) -> str:
+    ) -> ToolResult:
         """Get source files for a component.
 
         Args:
@@ -511,10 +566,13 @@ Use `list_source_components` to see the feature components that make up this age
                 if f.path.startswith(component_path + "/") and f.is_file()
             ]
         except GitHubClientError as e:
-            return f"Could not access component '{component}': {e}"
+            return ToolResult.failed(error=f"Could not access component '{component}': {e}")
 
         if not comp_files:
-            return f"Component '{component}' not found or has no files"
+            return ToolResult.ok(
+                f"Component '{component}' not found or has no files",
+                data={"component": component, "file_count": 0},
+            )
 
         lines = [f"# Component: {component}\n"]
         lines.append(f"**Path:** {component_path}")
@@ -546,7 +604,10 @@ Use `list_source_components` to see the feature components that make up this age
             else:
                 lines.append(f"*Size: {f.size:,} bytes*")
 
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={"component": component, "path": component_path, "file_count": len(comp_files)},
+        )
 
     @tool(
         name="invalidate_github_cache",
@@ -557,7 +618,7 @@ Use `list_source_components` to see the feature components that make up this age
         self,
         repo: str,
         path: Optional[str] = None,
-    ) -> str:
+    ) -> ToolResult:
         """Invalidate cache entries.
 
         Args:
@@ -572,8 +633,14 @@ Use `list_source_components` to see the feature components that make up this age
         await self.cache.invalidate(repo, path=path)
 
         if path:
-            return f"Invalidated cache for {repo}:{path}"
-        return f"Invalidated all cache for {repo}"
+            return ToolResult.ok(
+                f"Invalidated cache for {repo}:{path}",
+                data={"repo": repo, "path": path},
+            )
+        return ToolResult.ok(
+            f"Invalidated all cache for {repo}",
+            data={"repo": repo, "path": None},
+        )
 
     # --- Issue tools ---
 
@@ -588,7 +655,7 @@ Use `list_source_components` to see the feature components that make up this age
         state: str = "open",
         labels: Optional[str] = None,
         max_results: int = 30,
-    ) -> str:
+    ) -> ToolResult:
         """List issues in a repository.
 
         Args:
@@ -608,10 +675,13 @@ Use `list_source_components` to see the feature components that make up this age
                 repo, state=state, labels=label_list, per_page=max_results,
             )
         except GitHubClientError as e:
-            return f"Could not list issues: {e}"
+            return ToolResult.failed(error=f"Could not list issues: {e}")
 
         if not issues:
-            return f"No {state} issues found in {repo}"
+            return ToolResult.ok(
+                f"No {state} issues found in {repo}",
+                data={"repo": repo, "state": state, "count": 0},
+            )
 
         lines = [f"# Issues in {repo} ({state})\n"]
         for issue in issues:
@@ -630,7 +700,10 @@ Use `list_source_components` to see the feature components that make up this age
             lines.append(line)
 
         lines.append(f"\n*{len(issues)} issue(s) shown*")
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={"repo": repo, "state": state, "count": len(issues)},
+        )
 
     @tool(
         name="get_github_issue",
@@ -641,7 +714,7 @@ Use `list_source_components` to see the feature components that make up this age
         self,
         issue_number: int,
         repo: str = "self",
-    ) -> str:
+    ) -> ToolResult:
         """Get a specific issue.
 
         Args:
@@ -656,7 +729,7 @@ Use `list_source_components` to see the feature components that make up this age
         try:
             issue = await self.client.get_issue(repo, issue_number)
         except GitHubClientError as e:
-            return f"Could not get issue #{issue_number}: {e}"
+            return ToolResult.failed(error=f"Could not get issue #{issue_number}: {e}")
 
         title = issue.get("title", "")
         state = issue.get("state", "")
@@ -685,7 +758,21 @@ Use `list_source_components` to see the feature components that make up this age
         lines.append(f"**Comments:** {comments_count}")
         lines.append(f"\n---\n\n{body}")
 
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={
+                "repo": repo,
+                "number": issue_number,
+                "title": title,
+                "state": state,
+                "author": author,
+                "labels": issue_labels,
+                "assignees": assignees,
+                "milestone": milestone_name,
+                "comments_count": comments_count,
+                "url": issue.get("html_url"),
+            },
+        )
 
     @tool(
         name="get_github_issue_comments",
@@ -697,7 +784,7 @@ Use `list_source_components` to see the feature components that make up this age
         issue_number: int,
         repo: str = "self",
         max_results: int = 30,
-    ) -> str:
+    ) -> ToolResult:
         """Get comments on an issue.
 
         Args:
@@ -715,10 +802,13 @@ Use `list_source_components` to see the feature components that make up this age
                 repo, issue_number, per_page=max_results,
             )
         except GitHubClientError as e:
-            return f"Could not get comments for issue #{issue_number}: {e}"
+            return ToolResult.failed(error=f"Could not get comments for issue #{issue_number}: {e}")
 
         if not comments:
-            return f"No comments on issue #{issue_number} in {repo}"
+            return ToolResult.ok(
+                f"No comments on issue #{issue_number} in {repo}",
+                data={"repo": repo, "number": issue_number, "count": 0},
+            )
 
         lines = [f"# Comments on #{issue_number} in {repo}\n"]
         for comment in comments:
@@ -731,4 +821,7 @@ Use `list_source_components` to see the feature components that make up this age
             lines.append("")
 
         lines.append(f"\n*{len(comments)} comment(s)*")
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={"repo": repo, "number": issue_number, "count": len(comments)},
+        )
