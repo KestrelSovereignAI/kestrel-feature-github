@@ -320,7 +320,8 @@ class TestGitHubFeature:
 
         result = await feature.read_github_file(repo="self", path="test.py")
 
-        assert "cached content" in result
+        assert "cached content" in result.confirmation
+        assert result.data["cached"] is True
 
     @pytest.mark.asyncio
     async def test_get_definition_non_python(self, feature):
@@ -330,4 +331,33 @@ class TestGitHubFeature:
             name="something"
         )
 
-        assert "only supports Python" in result
+        assert "only supports Python" in result.error
+
+
+# ============== Contract Tests ==============
+
+def test_all_tool_methods_return_toolresult():
+    """Guard against regressing to str returns: the GitHubFeature module is on
+    the sovereign migrated-feature allowlist, so every @tool method MUST be
+    annotated ``-> ToolResult`` or registration hard-fails in the host."""
+    import typing
+
+    from kestrel_sdk.tools.result import ToolResult
+
+    tool_methods = [
+        "read_github_file",
+        "list_github_files",
+        "search_github_code",
+        "get_code_definition",
+        "list_code_definitions",
+        "get_self_repo_info",
+        "list_source_components",
+        "get_component_source",
+        "invalidate_github_cache",
+        "list_github_issues",
+        "get_github_issue",
+        "get_github_issue_comments",
+    ]
+    for name in tool_methods:
+        hints = typing.get_type_hints(getattr(GitHubFeature, name))
+        assert hints.get("return") is ToolResult, f"{name} must return ToolResult"
