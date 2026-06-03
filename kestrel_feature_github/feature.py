@@ -825,3 +825,334 @@ Use `list_source_components` to see the feature components that make up this age
             "\n".join(lines),
             data={"repo": repo, "number": issue_number, "count": len(comments)},
         )
+
+    # --- Write tools (issues, PRs, comments, labels) ---
+    #
+    # These let the agent close its own loops: file a follow-up ticket
+    # surfaced during diagnosis, open a rescue PR for an orphaned branch,
+    # comment on its own filed issues, edit lifecycle labels, close
+    # completed issues, and merge an own-PR that has reached green CI.
+    #
+    # Each is a thin wrapper around the client write methods with the
+    # ToolResult envelope and consistent failure shaping. The PRE_TOOL_USE
+    # hook chain gates these per-agent at the kestrel-sovereign layer —
+    # no enforcement here, by design.
+
+    @tool(
+        name="create_github_issue",
+        description=(
+            "File a new GitHub issue. Returns the URL and number on success. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def create_github_issue(
+        self,
+        title: str,
+        body: str,
+        repo: str = "self",
+        labels: Optional[str] = None,
+        assignees: Optional[str] = None,
+    ) -> ToolResult:
+        """Open a new issue.
+
+        Args:
+            title: Issue title.
+            body: Issue body (markdown).
+            repo: ``owner/repo`` or ``self``.
+            labels: Comma-separated labels.
+            assignees: Comma-separated GitHub usernames.
+        """
+        repo = self._resolve_repo(repo)
+        # Filter empty CSV entries — a trailing comma or extra space would
+        # otherwise send an empty string to GitHub and trigger a 422 from
+        # validation (codex round 1 P2).
+        parsed_labels = (
+            [s.strip() for s in labels.split(",") if s.strip()] if labels else None
+        )
+        parsed_assignees = (
+            [s.strip() for s in assignees.split(",") if s.strip()] if assignees else None
+        )
+        try:
+            issue = await self.client.create_issue(
+                repo,
+                title=title,
+                body=body,
+                labels=parsed_labels or None,
+                assignees=parsed_assignees or None,
+            )
+        except GitHubClientError as e:
+            return ToolResult.failed(error=f"Could not create issue: {e}")
+
+        return ToolResult.ok(
+            f"Filed {repo}#{issue.get('number')}: {issue.get('html_url')}",
+            data={
+                "repo": repo,
+                "number": issue.get("number"),
+                "url": issue.get("html_url"),
+            },
+        )
+
+    @tool(
+        name="add_github_issue_comment",
+        description=(
+            "Post a comment on a GitHub issue or pull request. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def add_github_issue_comment(
+        self,
+        issue_number: int,
+        body: str,
+        repo: str = "self",
+    ) -> ToolResult:
+        """Add a comment to an issue or PR."""
+        repo = self._resolve_repo(repo)
+        try:
+            comment = await self.client.add_issue_comment(repo, issue_number, body)
+        except GitHubClientError as e:
+            return ToolResult.failed(
+                error=f"Could not comment on #{issue_number}: {e}",
+            )
+        return ToolResult.ok(
+            f"Commented on {repo}#{issue_number}",
+            data={
+                "repo": repo,
+                "number": issue_number,
+                "comment_id": comment.get("id"),
+                "url": comment.get("html_url"),
+            },
+        )
+
+    @tool(
+        name="add_github_label",
+        description=(
+            "Add one or more labels to an issue or PR. Comma-separated. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def add_github_label(
+        self,
+        issue_number: int,
+        labels: str,
+        repo: str = "self",
+    ) -> ToolResult:
+        """Add labels to an issue or PR (existing labels preserved)."""
+        repo = self._resolve_repo(repo)
+        label_list = [s.strip() for s in labels.split(",") if s.strip()]
+        if not label_list:
+            return ToolResult.failed(error="No labels provided")
+        try:
+            updated = await self.client.add_labels(repo, issue_number, label_list)
+        except GitHubClientError as e:
+            return ToolResult.failed(
+                error=f"Could not add labels to #{issue_number}: {e}",
+            )
+        return ToolResult.ok(
+            f"Added {len(label_list)} label(s) to {repo}#{issue_number}",
+            data={
+                "repo": repo,
+                "number": issue_number,
+                "added": label_list,
+                "current": [l.get("name") for l in updated],
+            },
+        )
+
+    @tool(
+        name="remove_github_label",
+        description=(
+            "Remove a single label from an issue or PR. Idempotent — "
+            "succeeds whether or not the label was present. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def remove_github_label(
+        self,
+        issue_number: int,
+        label: str,
+        repo: str = "self",
+    ) -> ToolResult:
+        """Remove a single label from an issue or PR."""
+        repo = self._resolve_repo(repo)
+        try:
+            await self.client.remove_label(repo, issue_number, label)
+        except GitHubClientError as e:
+            return ToolResult.failed(
+                error=f"Could not remove label {label!r} from #{issue_number}: {e}",
+            )
+        return ToolResult.ok(
+            f"Removed label {label!r} from {repo}#{issue_number}",
+            data={"repo": repo, "number": issue_number, "removed": label},
+        )
+
+    @tool(
+        name="close_github_issue",
+        description=(
+            "Close a GitHub issue. ``state_reason`` is one of "
+            "``completed`` (default), ``not_planned``. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def close_github_issue(
+        self,
+        issue_number: int,
+        repo: str = "self",
+        state_reason: str = "completed",
+    ) -> ToolResult:
+        """Close an issue with an explicit reason."""
+        repo = self._resolve_repo(repo)
+        try:
+            issue = await self.client.update_issue(
+                repo,
+                issue_number,
+                state="closed",
+                state_reason=state_reason,
+            )
+        except GitHubClientError as e:
+            return ToolResult.failed(
+                error=f"Could not close #{issue_number}: {e}",
+            )
+        return ToolResult.ok(
+            f"Closed {repo}#{issue_number} ({state_reason})",
+            data={
+                "repo": repo,
+                "number": issue_number,
+                "state": issue.get("state"),
+                "state_reason": issue.get("state_reason"),
+            },
+        )
+
+    @tool(
+        name="reopen_github_issue",
+        description=(
+            "Reopen a closed GitHub issue. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def reopen_github_issue(
+        self,
+        issue_number: int,
+        repo: str = "self",
+    ) -> ToolResult:
+        """Reopen a closed issue."""
+        repo = self._resolve_repo(repo)
+        try:
+            issue = await self.client.update_issue(
+                repo,
+                issue_number,
+                state="open",
+                state_reason="reopened",
+            )
+        except GitHubClientError as e:
+            return ToolResult.failed(
+                error=f"Could not reopen #{issue_number}: {e}",
+            )
+        return ToolResult.ok(
+            f"Reopened {repo}#{issue_number}",
+            data={
+                "repo": repo,
+                "number": issue_number,
+                "state": issue.get("state"),
+            },
+        )
+
+    @tool(
+        name="create_github_pull_request",
+        description=(
+            "Open a pull request on a GitHub repository. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def create_github_pull_request(
+        self,
+        title: str,
+        head: str,
+        base: str,
+        body: str = "",
+        repo: str = "self",
+        draft: bool = False,
+    ) -> ToolResult:
+        """Open a pull request.
+
+        Args:
+            title: PR title.
+            head: Branch carrying changes (same-repo: branch name;
+                cross-fork: ``owner:branch``).
+            base: Target branch on the repo.
+            body: PR body (markdown).
+            repo: ``owner/repo`` or ``self``.
+            draft: Open as a draft PR.
+        """
+        repo = self._resolve_repo(repo)
+        try:
+            pr = await self.client.create_pull_request(
+                repo,
+                title=title,
+                head=head,
+                base=base,
+                body=body,
+                draft=draft,
+            )
+        except GitHubClientError as e:
+            return ToolResult.failed(error=f"Could not open PR: {e}")
+        return ToolResult.ok(
+            f"Opened {repo}#{pr.get('number')}: {pr.get('html_url')}",
+            data={
+                "repo": repo,
+                "number": pr.get("number"),
+                "url": pr.get("html_url"),
+                "head_sha": (pr.get("head") or {}).get("sha"),
+                "draft": pr.get("draft"),
+            },
+        )
+
+    @tool(
+        name="merge_github_pull_request",
+        description=(
+            "Merge a pull request once CI/review allow. "
+            "``merge_method`` is ``squash`` (default), ``merge``, or ``rebase``. "
+            "Pass ``sha`` to refuse the merge if the PR head has moved. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def merge_github_pull_request(
+        self,
+        pull_number: int,
+        repo: str = "self",
+        merge_method: str = "squash",
+        commit_title: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        sha: Optional[str] = None,
+    ) -> ToolResult:
+        """Merge a PR with the chosen method."""
+        repo = self._resolve_repo(repo)
+        try:
+            result = await self.client.merge_pull_request(
+                repo,
+                pull_number,
+                merge_method=merge_method,
+                commit_title=commit_title,
+                commit_message=commit_message,
+                sha=sha,
+            )
+        except GitHubClientError as e:
+            return ToolResult.failed(
+                error=f"Could not merge PR #{pull_number}: {e}",
+            )
+        return ToolResult.ok(
+            f"Merged {repo}#{pull_number} ({merge_method}) at {result.get('sha','?')[:10]}",
+            data={
+                "repo": repo,
+                "number": pull_number,
+                "merge_method": merge_method,
+                "merge_commit_sha": result.get("sha"),
+                "merged": result.get("merged"),
+            },
+        )

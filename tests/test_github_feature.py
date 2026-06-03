@@ -297,6 +297,7 @@ class TestGitHubFeature:
             tools = feature.get_tools()
 
             tool_names = [t.name for t in tools]
+            # Read tools
             assert "read_github_file" in tool_names
             assert "list_github_files" in tool_names
             assert "search_github_code" in tool_names
@@ -305,6 +306,15 @@ class TestGitHubFeature:
             assert "get_self_repo_info" in tool_names
             assert "list_source_components" in tool_names
             assert "get_component_source" in tool_names
+            # Write tools (#1502)
+            assert "create_github_issue" in tool_names
+            assert "add_github_issue_comment" in tool_names
+            assert "add_github_label" in tool_names
+            assert "remove_github_label" in tool_names
+            assert "close_github_issue" in tool_names
+            assert "reopen_github_issue" in tool_names
+            assert "create_github_pull_request" in tool_names
+            assert "merge_github_pull_request" in tool_names
 
     @pytest.mark.asyncio
     async def test_read_file_cached(self, feature):
@@ -357,6 +367,15 @@ def test_all_tool_methods_return_toolresult():
         "list_github_issues",
         "get_github_issue",
         "get_github_issue_comments",
+        # Write tools (#1502)
+        "create_github_issue",
+        "add_github_issue_comment",
+        "add_github_label",
+        "remove_github_label",
+        "close_github_issue",
+        "reopen_github_issue",
+        "create_github_pull_request",
+        "merge_github_pull_request",
     ]
     for name in tool_methods:
         hints = typing.get_type_hints(getattr(GitHubFeature, name))
