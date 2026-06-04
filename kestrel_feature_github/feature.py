@@ -449,6 +449,63 @@ Use `list_source_components` to see the feature components that make up this age
             return ToolResult.failed(error=f"Error getting repo info: {e}")
 
     @tool(
+        name="get_github_repo_info",
+        description=(
+            "Get metadata for any accessible GitHub repository, including "
+            "visibility, default branch, description, and open issue count. "
+            "Use 'self' as repo for the agent's own repo."
+        ),
+        category=ToolCategory.DATA_ACCESS,
+    )
+    async def get_github_repo_info(self, repo: str = "self") -> ToolResult:
+        """Get metadata for an arbitrary repository.
+
+        Args:
+            repo: Repository in 'owner/repo' format, or 'self' for the
+                agent's own repo.
+
+        Returns:
+            Structured repository metadata including visibility.
+        """
+        repo = self._resolve_repo(repo)
+
+        try:
+            info = await self.client.get_repo_info(repo)
+        except GitHubClientError as e:
+            return ToolResult.failed(error=f"Error getting repo info for {repo}: {e}")
+
+        full_name = info.get("full_name", repo)
+        visibility = info.get("visibility", "unknown")
+        default_branch = info.get("default_branch")
+        description = info.get("description")
+        url = info.get("html_url")
+        open_issues_count = info.get("open_issues_count")
+        updated_at = info.get("updated_at")
+
+        lines = [
+            f"# {full_name}\n",
+            f"**Visibility:** {visibility}",
+            f"**Default Branch:** {default_branch or 'unknown'}",
+            f"**Description:** {description or 'N/A'}",
+            f"**URL:** {url}",
+            f"**Open Issues:** {open_issues_count if open_issues_count is not None else 'unknown'}",
+            f"**Last Updated:** {updated_at or 'unknown'}",
+        ]
+
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={
+                "repo": full_name,
+                "visibility": visibility,
+                "default_branch": default_branch,
+                "description": description,
+                "url": url,
+                "open_issues_count": open_issues_count,
+                "updated_at": updated_at,
+            },
+        )
+
+    @tool(
         name="list_source_components",
         description="List all feature components in the agent's source code with their manifests.",
         category=ToolCategory.DATA_ACCESS,
