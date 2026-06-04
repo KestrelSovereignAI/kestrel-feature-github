@@ -304,6 +304,7 @@ class TestGitHubFeature:
             assert "get_code_definition" in tool_names
             assert "list_code_definitions" in tool_names
             assert "get_self_repo_info" in tool_names
+            assert "get_github_repo_info" in tool_names
             assert "list_source_components" in tool_names
             assert "get_component_source" in tool_names
             # Write tools (#1502)
@@ -334,6 +335,67 @@ class TestGitHubFeature:
         assert result.data["cached"] is True
 
     @pytest.mark.asyncio
+    async def test_get_github_repo_info_self(self, feature):
+        repo_payload = {
+            "full_name": "KestrelSovereignAI/kestrel-sovereign",
+            "visibility": "private",
+            "default_branch": "main",
+            "description": "Sovereign agent",
+            "html_url": "https://github.com/KestrelSovereignAI/kestrel-sovereign",
+            "open_issues_count": 7,
+            "updated_at": "2026-06-01T00:00:00Z",
+        }
+        with patch.object(
+            GitHubClient, "get_repo_info", return_value=repo_payload
+        ) as mock_info:
+            result = await feature.get_github_repo_info(repo="self")
+
+        # 'self' must resolve to the configured self repo before the client call.
+        mock_info.assert_awaited_once_with("KestrelSovereignAI/kestrel-sovereign")
+        assert result.error is None, result.error
+        assert result.data["repo"] == "KestrelSovereignAI/kestrel-sovereign"
+        assert result.data["visibility"] == "private"
+        assert result.data["default_branch"] == "main"
+        assert result.data["description"] == "Sovereign agent"
+        assert result.data["url"].endswith("/kestrel-sovereign")
+        assert result.data["open_issues_count"] == 7
+        assert result.data["updated_at"] == "2026-06-01T00:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_get_github_repo_info_arbitrary_repo(self, feature):
+        repo_payload = {
+            "full_name": "octocat/hello-world",
+            "visibility": "public",
+            "default_branch": "master",
+            "description": "My first repo",
+            "html_url": "https://github.com/octocat/hello-world",
+            "open_issues_count": 0,
+            "updated_at": "2026-05-30T12:00:00Z",
+        }
+        with patch.object(
+            GitHubClient, "get_repo_info", return_value=repo_payload
+        ) as mock_info:
+            result = await feature.get_github_repo_info(repo="octocat/hello-world")
+
+        mock_info.assert_awaited_once_with("octocat/hello-world")
+        assert result.error is None, result.error
+        assert result.data["repo"] == "octocat/hello-world"
+        assert result.data["visibility"] == "public"
+        assert "public" in result.confirmation
+
+    @pytest.mark.asyncio
+    async def test_get_github_repo_info_error(self, feature):
+        with patch.object(
+            GitHubClient,
+            "get_repo_info",
+            side_effect=GitHubClientError("Repository not found: x/missing", 404),
+        ):
+            result = await feature.get_github_repo_info(repo="x/missing")
+
+        assert result.error is not None
+        assert "Error getting repo info" in result.error
+
+    @pytest.mark.asyncio
     async def test_get_definition_non_python(self, feature):
         result = await feature.get_code_definition(
             repo="self",
@@ -361,6 +423,7 @@ def test_all_tool_methods_return_toolresult():
         "get_code_definition",
         "list_code_definitions",
         "get_self_repo_info",
+        "get_github_repo_info",
         "list_source_components",
         "get_component_source",
         "invalidate_github_cache",

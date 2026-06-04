@@ -52,6 +52,12 @@
 - **Description**: Get information about the agent's own source repository
 - **Category**: data_access
 
+### get_github_repo_info
+- **Description**: Get metadata for any accessible GitHub repository, including visibility, default branch, description, and open issue count
+- **Category**: data_access
+- **Parameters**:
+  - `repo` (string, optional): Repository in 'owner/repo' format, or 'self' (default: self)
+
 ### list_source_components
 - **Description**: List all feature components in the agent's source code
 - **Category**: data_access
