@@ -742,21 +742,38 @@ Use `list_source_components` to see the feature components that make up this age
             try:
                 info = await self.client.get_repo_info(repo)
                 branch = str(info.get("default_branch") or "main")
-                issues = await self.client.list_issues(repo, state="open", per_page=100)
-                prs = await self.client.list_pull_requests(repo, state="open")
-                runs = await self.client.list_workflow_runs(repo, branch=branch, per_page=1)
-                items = classify_stale_work(
-                    repo,
-                    issues=issues,
-                    pull_requests=prs,
-                    latest_default_run=runs[0] if runs else None,
-                    default_branch=branch,
-                    now=now,
-                    stale_days=stale_days,
+                # Oldest-updated first so the stalest claimed issues land on the
+                # first page rather than being hidden behind a large backlog.
+                issues = await self.client.list_issues(
+                    repo, state="open", per_page=100, sort="updated", direction="asc",
                 )
-                findings.extend(asdict(it) for it in items)
+                prs = await self.client.list_pull_requests(repo, state="open")
             except GitHubClientError as e:
                 errors.append({"repo": repo, "error": str(e)})
+                continue
+
+            # CI status is best-effort: Actions may be disabled, or the token
+            # may have Issues/PRs read but not Actions read. A failure here must
+            # NOT suppress the issue/PR findings — just skip the red-branch check.
+            latest_run = None
+            try:
+                runs = await self.client.list_workflow_runs(repo, branch=branch, per_page=1)
+                latest_run = runs[0] if runs else None
+            except GitHubClientError as e:
+                errors.append(
+                    {"repo": repo, "error": f"CI status unavailable: {e}", "partial": True}
+                )
+
+            items = classify_stale_work(
+                repo,
+                issues=issues,
+                pull_requests=prs,
+                latest_default_run=latest_run,
+                default_branch=branch,
+                now=now,
+                stale_days=stale_days,
+            )
+            findings.extend(asdict(it) for it in items)
 
         findings.sort(key=lambda f: (severity_order.get(f["severity"], 9), f["repo"], f["ref"]))
 

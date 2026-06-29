@@ -135,3 +135,38 @@ class TestScanStaleWorkTool:
         assert result.status.value == "ok"
         assert result.data["findings"] == []
         assert result.data["errors"][0]["repo"] == "o/missing"
+
+    @pytest.mark.asyncio
+    async def test_actions_failure_does_not_suppress_issue_pr_findings(self, feature):
+        """A token without Actions read must still surface issue/PR findings."""
+        from kestrel_feature_github.client import GitHubClientError
+
+        feature.client.get_repo_info = AsyncMock(return_value={"default_branch": "main"})
+        feature.client.list_issues = AsyncMock(
+            return_value=[_issue(1, labels=["agent-claimed"], days_ago=5)]
+        )
+        feature.client.list_pull_requests = AsyncMock(return_value=[_pr(10, days_ago=4)])
+        feature.client.list_workflow_runs = AsyncMock(
+            side_effect=GitHubClientError("Actions read denied", 403)
+        )
+
+        result = await feature.scan_stale_work(repos="o/r", stale_days=3)
+
+        assert result.status.value == "ok"
+        kinds = {f["kind"] for f in result.data["findings"]}
+        # issue + PR findings survive; only the red-branch check is skipped
+        assert kinds == {"stalled_claim", "stale_pr"}
+        assert any(e.get("partial") for e in result.data["errors"])
+
+    @pytest.mark.asyncio
+    async def test_scan_requests_oldest_updated_issues_first(self, feature):
+        feature.client.get_repo_info = AsyncMock(return_value={"default_branch": "main"})
+        feature.client.list_issues = AsyncMock(return_value=[])
+        feature.client.list_pull_requests = AsyncMock(return_value=[])
+        feature.client.list_workflow_runs = AsyncMock(return_value=[])
+
+        await feature.scan_stale_work(repos="o/r", stale_days=3)
+
+        _, kwargs = feature.client.list_issues.call_args
+        assert kwargs.get("sort") == "updated"
+        assert kwargs.get("direction") == "asc"

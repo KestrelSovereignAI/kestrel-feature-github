@@ -430,6 +430,8 @@ class GitHubClient:
         state: str = "open",
         labels: Optional[list[str]] = None,
         per_page: int = 30,
+        sort: Optional[str] = None,
+        direction: Optional[str] = None,
     ) -> list[dict]:
         """List issues in a repository.
 
@@ -438,6 +440,9 @@ class GitHubClient:
             state: Issue state filter ('open', 'closed', 'all')
             labels: Optional list of label names to filter by
             per_page: Number of results per page (max 100)
+            sort: Optional sort field ('created', 'updated', 'comments').
+                GitHub defaults to 'created' descending.
+            direction: Optional sort direction ('asc', 'desc').
 
         Returns:
             List of issue dicts (excludes pull requests)
@@ -454,6 +459,10 @@ class GitHubClient:
         }
         if labels:
             params["labels"] = ",".join(labels)
+        if sort:
+            params["sort"] = sort
+        if direction:
+            params["direction"] = direction
 
         response = await client.get(
             f"/repos/{owner}/{repo_name}/issues",
