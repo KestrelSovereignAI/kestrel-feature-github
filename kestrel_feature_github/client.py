@@ -2,7 +2,7 @@
 import base64
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote
 
 import httpx
@@ -430,6 +430,8 @@ class GitHubClient:
         state: str = "open",
         labels: Optional[list[str]] = None,
         per_page: int = 30,
+        sort: Optional[str] = None,
+        direction: Optional[str] = None,
     ) -> list[dict]:
         """List issues in a repository.
 
@@ -438,6 +440,9 @@ class GitHubClient:
             state: Issue state filter ('open', 'closed', 'all')
             labels: Optional list of label names to filter by
             per_page: Number of results per page (max 100)
+            sort: Optional sort field ('created', 'updated', 'comments').
+                GitHub defaults to 'created' descending.
+            direction: Optional sort direction ('asc', 'desc').
 
         Returns:
             List of issue dicts (excludes pull requests)
@@ -454,6 +459,10 @@ class GitHubClient:
         }
         if labels:
             params["labels"] = ",".join(labels)
+        if sort:
+            params["sort"] = sort
+        if direction:
+            params["direction"] = direction
 
         response = await client.get(
             f"/repos/{owner}/{repo_name}/issues",
@@ -470,6 +479,92 @@ class GitHubClient:
         # GitHub's issues endpoint also returns PRs; filter them out
         items = response.json()
         return [i for i in items if "pull_request" not in i]
+
+    async def list_pull_requests(
+        self,
+        repo: str,
+        state: str = "open",
+        per_page: int = 100,
+    ) -> list[dict]:
+        """List pull requests in a repository (oldest-updated first).
+
+        Args:
+            repo: Repository in 'owner/repo' format
+            state: PR state filter ('open', 'closed', 'all')
+            per_page: Number of results per page (max 100)
+
+        Returns:
+            List of pull-request dicts.
+
+        Raises:
+            GitHubClientError: If request fails
+        """
+        owner, repo_name = self._parse_repo(repo)
+        client = await self._get_client()
+
+        response = await client.get(
+            f"/repos/{owner}/{repo_name}/pulls",
+            params={
+                "state": state,
+                "per_page": min(per_page, 100),
+                "sort": "updated",
+                "direction": "asc",
+            },
+        )
+
+        if response.status_code == 404:
+            raise GitHubClientError(f"Repository not found: {repo}", 404)
+        elif response.status_code == 403:
+            raise GitHubClientError("Rate limited or access denied", 403)
+        elif response.status_code != 200:
+            raise GitHubClientError(f"GitHub API error: {response.text}", response.status_code)
+
+        return response.json()
+
+    async def list_workflow_runs(
+        self,
+        repo: str,
+        branch: Optional[str] = None,
+        per_page: int = 1,
+        status: str = "completed",
+    ) -> list[dict]:
+        """List Actions workflow runs for a repo (newest first).
+
+        Args:
+            repo: Repository in 'owner/repo' format
+            branch: Optional branch filter (e.g. the default branch)
+            per_page: Number of runs to return (max 100)
+            status: Run status filter (default 'completed')
+
+        Returns:
+            List of workflow-run dicts (the ``workflow_runs`` array).
+
+        Raises:
+            GitHubClientError: If request fails
+        """
+        owner, repo_name = self._parse_repo(repo)
+        client = await self._get_client()
+
+        params: dict[str, Any] = {
+            "per_page": min(per_page, 100),
+            "status": status,
+        }
+        if branch:
+            params["branch"] = branch
+
+        response = await client.get(
+            f"/repos/{owner}/{repo_name}/actions/runs",
+            params=params,
+        )
+
+        if response.status_code == 404:
+            raise GitHubClientError(f"Repository not found: {repo}", 404)
+        elif response.status_code == 403:
+            raise GitHubClientError("Rate limited or access denied", 403)
+        elif response.status_code != 200:
+            raise GitHubClientError(f"GitHub API error: {response.text}", response.status_code)
+
+        return response.json().get("workflow_runs", [])
 
     async def get_issue(
         self,

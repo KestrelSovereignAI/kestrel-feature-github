@@ -1,6 +1,8 @@
 """GitHub Feature - Repository access and code introspection."""
 import logging
 import os
+from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import yaml
@@ -13,6 +15,7 @@ from .ast_analyzer import ASTAnalyzer
 from .cache import GitHubCache
 from .client import GitHubClient, GitHubClientError
 from .models import ComponentManifest, FileType
+from .stale_work import classify_stale_work
 
 logger = logging.getLogger(__name__)
 
@@ -697,6 +700,98 @@ Use `list_source_components` to see the feature components that make up this age
         return ToolResult.ok(
             f"Invalidated all cache for {repo}",
             data={"repo": repo, "path": None},
+        )
+
+    # --- Stalled-work tools ---
+
+    @tool(
+        name="scan_stale_work",
+        description=(
+            "Scan one or more repos for stalled or blocking work: a red default "
+            "branch (failed CI), claimed issues gone quiet, and stale open PRs. "
+            "The detection half of the proactive rescue loop (sovereign #1523)."
+        ),
+        category=ToolCategory.DATA_ACCESS,
+    )
+    async def scan_stale_work(
+        self,
+        repos: str = "self",
+        stale_days: int = 3,
+    ) -> ToolResult:
+        """Detect stalled/blocking work across repos.
+
+        Args:
+            repos: Comma-separated 'owner/repo' slugs, or 'self' for the
+                agent's own repo.
+            stale_days: An issue/PR counts as stale after this many days with
+                no update (default 3).
+
+        Returns:
+            Structured findings sorted by severity (high first).
+        """
+        slugs = [self._resolve_repo(r.strip()) for r in repos.split(",") if r.strip()]
+        if not slugs:
+            return ToolResult.failed(error="No repositories given")
+
+        now = datetime.now(timezone.utc)
+        severity_order = {"high": 0, "medium": 1, "low": 2}
+        findings: list[dict] = []
+        errors: list[dict] = []
+
+        for repo in slugs:
+            try:
+                info = await self.client.get_repo_info(repo)
+                branch = str(info.get("default_branch") or "main")
+                # Oldest-updated first so the stalest claimed issues land on the
+                # first page rather than being hidden behind a large backlog.
+                issues = await self.client.list_issues(
+                    repo, state="open", per_page=100, sort="updated", direction="asc",
+                )
+                prs = await self.client.list_pull_requests(repo, state="open")
+            except GitHubClientError as e:
+                errors.append({"repo": repo, "error": str(e)})
+                continue
+
+            # CI status is best-effort: Actions may be disabled, or the token
+            # may have Issues/PRs read but not Actions read. A failure here must
+            # NOT suppress the issue/PR findings — just skip the red-branch check.
+            latest_run = None
+            try:
+                runs = await self.client.list_workflow_runs(repo, branch=branch, per_page=1)
+                latest_run = runs[0] if runs else None
+            except GitHubClientError as e:
+                errors.append(
+                    {"repo": repo, "error": f"CI status unavailable: {e}", "partial": True}
+                )
+
+            items = classify_stale_work(
+                repo,
+                issues=issues,
+                pull_requests=prs,
+                latest_default_run=latest_run,
+                default_branch=branch,
+                now=now,
+                stale_days=stale_days,
+            )
+            findings.extend(asdict(it) for it in items)
+
+        findings.sort(key=lambda f: (severity_order.get(f["severity"], 9), f["repo"], f["ref"]))
+
+        high = sum(1 for f in findings if f["severity"] == "high")
+        summary = (
+            f"{len(findings)} stalled-work finding(s) across {len(slugs)} repo(s)"
+            f" ({high} high)."
+        )
+        if errors:
+            summary += f" {len(errors)} repo(s) could not be scanned."
+        return ToolResult.ok(
+            summary,
+            data={
+                "findings": findings,
+                "errors": errors,
+                "repos_scanned": slugs,
+                "stale_days": stale_days,
+            },
         )
 
     # --- Issue tools ---
