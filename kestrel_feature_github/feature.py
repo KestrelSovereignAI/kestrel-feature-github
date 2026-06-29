@@ -16,6 +16,10 @@ from .cache import GitHubCache
 from .client import GitHubClient, GitHubClientError
 from .models import ComponentManifest, FileType
 from .stale_work import classify_stale_work
+from .stalled_sweep_source import (
+    SOURCE_NAME as STALLED_SWEEP_SOURCE_NAME,
+    build_fleet_stalled_sweep_registration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +28,18 @@ logger = logging.getLogger(__name__)
 GITHUB_SELF_REPO = os.getenv("GITHUB_SELF_REPO", "KestrelSovereignAI/kestrel-sovereign")
 GITHUB_DEFAULT_BRANCH = os.getenv("GITHUB_DEFAULT_BRANCH", "main")
 GITHUB_SELF_FEATURES_ROOT = os.getenv("GITHUB_SELF_FEATURES_ROOT", "kestrel_sovereign/features")
+
+
+def _configured_fleet_repos() -> list[str]:
+    """Operator-configured fleet the agent watches (comma-separated env).
+
+    The fleet membership is a deployment fact, not something to hardcode, so it
+    lives in config next to ``GITHUB_SELF_REPO``. Empty/unset => just the
+    agent's own repo, so ``repos="fleet"`` always resolves to something useful.
+    """
+    raw = os.getenv("GITHUB_FLEET_REPOS", "")
+    repos = [r.strip() for r in raw.split(",") if r.strip()]
+    return repos or [GITHUB_SELF_REPO]
 
 
 class GitHubFeature(Feature):
@@ -50,7 +66,37 @@ class GitHubFeature(Feature):
     async def initialize(self):
         """Initialize the feature."""
         # Client and cache are lazily initialized
-        pass
+        self._register_stalled_sweep_source()
+
+    def _register_stalled_sweep_source(self) -> None:
+        """Register the fleet_stalled_sweep ACTION source with the agent's
+        signal registry, if one is available (the rescue workflow's detect
+        stage dispatches to it). Idempotent and best-effort."""
+        signal_registry = getattr(self.agent, "signal_registry", None)
+        if signal_registry is None:
+            return
+        try:
+            if signal_registry.get(STALLED_SWEEP_SOURCE_NAME) is None:
+                signal_registry.register(
+                    build_fleet_stalled_sweep_registration(self._fleet_sweep_handler)
+                )
+        except Exception as exc:  # noqa: BLE001 - registration is best-effort
+            logger.warning(
+                "Could not register fleet_stalled_sweep signal source: %s", exc
+            )
+
+    async def _fleet_sweep_handler(self, payload: dict) -> dict:
+        """ACTION handler for fleet_stalled_sweep: scan the configured fleet
+        (or an explicit repos spec) and return structured findings."""
+        stale_days = int(payload.get("stale_days", 3))
+        slugs = self._resolve_repos(str(payload.get("repos", "fleet")))
+        findings, errors = await self._scan_repos(slugs, stale_days)
+        return {
+            "findings": findings,
+            "errors": errors,
+            "repos_scanned": slugs,
+            "stale_days": stale_days,
+        }
 
     @property
     def is_available(self) -> bool:
@@ -715,24 +761,61 @@ Use `list_source_components` to see the feature components that make up this age
     )
     async def scan_stale_work(
         self,
-        repos: str = "self",
+        repos: str = "fleet",
         stale_days: int = 3,
     ) -> ToolResult:
         """Detect stalled/blocking work across repos.
 
         Args:
-            repos: Comma-separated 'owner/repo' slugs, or 'self' for the
-                agent's own repo.
+            repos: Comma-separated 'owner/repo' slugs, 'self' for the agent's
+                own repo, or 'fleet' (default) for the configured fleet
+                (``GITHUB_FLEET_REPOS``, falling back to 'self').
             stale_days: An issue/PR counts as stale after this many days with
                 no update (default 3).
 
         Returns:
             Structured findings sorted by severity (high first).
         """
-        slugs = [self._resolve_repo(r.strip()) for r in repos.split(",") if r.strip()]
+        slugs = self._resolve_repos(repos)
         if not slugs:
             return ToolResult.failed(error="No repositories given")
 
+        findings, errors = await self._scan_repos(slugs, stale_days)
+
+        high = sum(1 for f in findings if f["severity"] == "high")
+        summary = (
+            f"{len(findings)} stalled-work finding(s) across {len(slugs)} repo(s)"
+            f" ({high} high)."
+        )
+        if errors:
+            summary += f" {len(errors)} repo(s) had scan errors."
+        return ToolResult.ok(
+            summary,
+            data={
+                "findings": findings,
+                "errors": errors,
+                "repos_scanned": slugs,
+                "stale_days": stale_days,
+            },
+        )
+
+    def _resolve_repos(self, repos: str) -> list[str]:
+        """Resolve a repos spec to concrete slugs.
+
+        'fleet' => configured fleet (or self); otherwise a comma-separated list
+        of slugs / 'self' aliases.
+        """
+        if repos.strip().lower() == "fleet":
+            return _configured_fleet_repos()
+        return [self._resolve_repo(r.strip()) for r in repos.split(",") if r.strip()]
+
+    async def _scan_repos(
+        self, slugs: list[str], stale_days: int
+    ) -> tuple[list[dict], list[dict]]:
+        """Core sweep shared by the tool and the fleet_stalled_sweep source.
+
+        Returns ``(findings, errors)``; findings are dicts sorted by severity.
+        """
         now = datetime.now(timezone.utc)
         severity_order = {"high": 0, "medium": 1, "low": 2}
         findings: list[dict] = []
@@ -776,23 +859,7 @@ Use `list_source_components` to see the feature components that make up this age
             findings.extend(asdict(it) for it in items)
 
         findings.sort(key=lambda f: (severity_order.get(f["severity"], 9), f["repo"], f["ref"]))
-
-        high = sum(1 for f in findings if f["severity"] == "high")
-        summary = (
-            f"{len(findings)} stalled-work finding(s) across {len(slugs)} repo(s)"
-            f" ({high} high)."
-        )
-        if errors:
-            summary += f" {len(errors)} repo(s) could not be scanned."
-        return ToolResult.ok(
-            summary,
-            data={
-                "findings": findings,
-                "errors": errors,
-                "repos_scanned": slugs,
-                "stale_days": stale_days,
-            },
-        )
+        return findings, errors
 
     # --- Issue tools ---
 
