@@ -1,6 +1,7 @@
 """GitHub Feature - Repository access and code introspection."""
 import logging
 import os
+import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -40,6 +41,12 @@ def _configured_fleet_repos() -> list[str]:
     raw = os.getenv("GITHUB_FLEET_REPOS", "")
     repos = [r.strip() for r in raw.split(",") if r.strip()]
     return repos or [GITHUB_SELF_REPO]
+
+
+# ``owner/name`` in GitHub's allowed character set (which permits dot-prefixed
+# names like ``owner/.github``). Rejects multi-slash / injection input for a
+# clean error; the exact-match allowlist below is the actual authorization gate.
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 
 class GitHubFeature(Feature):
@@ -122,6 +129,42 @@ class GitHubFeature(Feature):
         if repo.lower() == "self":
             return GITHUB_SELF_REPO
         return repo
+
+    def _write_allowlist(self) -> set[str]:
+        """Repos this agent may WRITE to: its own repo + configured fleet."""
+        return {GITHUB_SELF_REPO, *_configured_fleet_repos()}
+
+    def _resolve_write_repo(
+        self, repo: str
+    ) -> tuple[Optional[str], Optional[ToolResult]]:
+        """Resolve AND authorize a write target.
+
+        The write tools (create/comment/label/close/reopen/PR/merge) must only
+        mutate the agent's own repo or a configured fleet repo. Without this a
+        prompt-injected agent could write to ANY repo the PAT can reach (F348).
+        Returns ``(resolved_repo, None)`` when allowed, or
+        ``(None, failed_ToolResult)`` when malformed or not on the allowlist.
+        """
+        resolved = self._resolve_repo(repo)
+        if not resolved or not _REPO_RE.match(resolved):
+            return None, ToolResult.failed(
+                error=f"Invalid repo {repo!r}: expected 'owner/name'."
+            )
+        allowed = self._write_allowlist()
+        # GitHub owner/repo names are case-insensitive: authorize by lowercased
+        # slug but return the CANONICAL casing from the allowlist for the API.
+        canonical_by_lower = {r.lower(): r for r in allowed}
+        match = canonical_by_lower.get(resolved.lower())
+        if match is None:
+            return None, ToolResult.failed(
+                error=(
+                    f"Refusing to write to {resolved!r}: not the agent's own "
+                    "repo or a configured fleet repo. Allowed: "
+                    f"{', '.join(sorted(allowed))}. Set GITHUB_FLEET_REPOS to "
+                    "authorize additional repos."
+                )
+            )
+        return match, None
 
     async def cleanup(self):
         """Clean up resources."""
@@ -1082,7 +1125,10 @@ Use `list_source_components` to see the feature components that make up this age
             labels: Comma-separated labels.
             assignees: Comma-separated GitHub usernames.
         """
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         # Filter empty CSV entries — a trailing comma or extra space would
         # otherwise send an empty string to GitHub and trigger a 422 from
         # validation (codex round 1 P2).
@@ -1127,7 +1173,10 @@ Use `list_source_components` to see the feature components that make up this age
         repo: str = "self",
     ) -> ToolResult:
         """Add a comment to an issue or PR."""
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         try:
             comment = await self.client.add_issue_comment(repo, issue_number, body)
         except GitHubClientError as e:
@@ -1159,7 +1208,10 @@ Use `list_source_components` to see the feature components that make up this age
         repo: str = "self",
     ) -> ToolResult:
         """Add labels to an issue or PR (existing labels preserved)."""
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         label_list = [s.strip() for s in labels.split(",") if s.strip()]
         if not label_list:
             return ToolResult.failed(error="No labels provided")
@@ -1195,7 +1247,10 @@ Use `list_source_components` to see the feature components that make up this age
         repo: str = "self",
     ) -> ToolResult:
         """Remove a single label from an issue or PR."""
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         try:
             await self.client.remove_label(repo, issue_number, label)
         except GitHubClientError as e:
@@ -1223,7 +1278,10 @@ Use `list_source_components` to see the feature components that make up this age
         state_reason: str = "completed",
     ) -> ToolResult:
         """Close an issue with an explicit reason."""
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         try:
             issue = await self.client.update_issue(
                 repo,
@@ -1259,7 +1317,10 @@ Use `list_source_components` to see the feature components that make up this age
         repo: str = "self",
     ) -> ToolResult:
         """Reopen a closed issue."""
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         try:
             issue = await self.client.update_issue(
                 repo,
@@ -1308,7 +1369,10 @@ Use `list_source_components` to see the feature components that make up this age
             repo: ``owner/repo`` or ``self``.
             draft: Open as a draft PR.
         """
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         try:
             pr = await self.client.create_pull_request(
                 repo,
@@ -1351,7 +1415,10 @@ Use `list_source_components` to see the feature components that make up this age
         sha: Optional[str] = None,
     ) -> ToolResult:
         """Merge a PR with the chosen method."""
-        repo = self._resolve_repo(repo)
+        # Authorize the write target (F348): own repo or configured fleet only.
+        repo, _write_denied = self._resolve_write_repo(repo)
+        if _write_denied is not None:
+            return _write_denied
         try:
             result = await self.client.merge_pull_request(
                 repo,

@@ -55,9 +55,12 @@ def _http_mock(
 
 
 @pytest.fixture
-def feature():
-    with patch.dict("os.environ", {"GITHUB_PAT": "test_token"}):
-        return GitHubFeature()
+def feature(monkeypatch):
+    monkeypatch.setenv("GITHUB_PAT", "test_token")
+    # Authorize the repos these wire tests write to. The write allowlist (F348)
+    # otherwise refuses any repo outside the agent's own + configured fleet.
+    monkeypatch.setenv("GITHUB_FLEET_REPOS", "x/y,x/missing")
+    return GitHubFeature()
 
 
 # --------------------------------------------------------------------- #
@@ -442,3 +445,63 @@ def test_write_tools_use_system_category():
             f"{name} must be SYSTEM (write surface), got "
             f"{tools_by_name[name].schema.category}"
         )
+
+
+# --------------------------------------------------------------------- #
+# F348: write-target allowlist + repo URL-encoding                       #
+# --------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_write_tool_refuses_repo_outside_allowlist(feature):
+    """A write to a repo that is neither the agent's own nor a configured
+    fleet repo must be refused BEFORE any HTTP call (F348)."""
+    http = _http_mock(post=_MockResponse(201, {"number": 1}))
+    with patch.object(GitHubClient, "_get_client", return_value=http):
+        result = await feature.create_github_issue(
+            title="pwn", body="b", repo="attacker/private-repo",
+        )
+    assert result.error is not None
+    assert "Refusing to write" in result.error
+    http.post.assert_not_called()  # never reached the network
+
+
+@pytest.mark.asyncio
+async def test_write_tool_refuses_malformed_repo(feature):
+    result = await feature.create_github_issue(title="t", body="b", repo="not-a-repo")
+    assert result.error is not None
+    assert "Invalid repo" in result.error
+
+
+@pytest.mark.asyncio
+async def test_write_tool_authorizes_case_insensitively(feature):
+    """GitHub slugs are case-insensitive: a differently-cased but allowlisted
+    repo is authorized, and the CANONICAL casing is sent to the API (F348)."""
+    http = _http_mock(post=_MockResponse(
+        201, {"number": 5, "html_url": "https://github.com/x/y/issues/5"},
+    ))
+    with patch.object(GitHubClient, "_get_client", return_value=http):
+        result = await feature.create_github_issue(
+            title="t", body="b", repo="X/Y",  # allowlist has 'x/y'
+        )
+    assert result.error is None, result.error
+    # Canonical (allowlisted) casing is used for the request path.
+    assert http.post.call_args.args[0] == "/repos/x/y/issues"
+
+
+def test_parse_repo_url_encodes_injection_segments():
+    """A crafted repo can't inject into / traverse the REST path (F348)."""
+    client = GitHubClient()
+    # A legit repo passes through unchanged (all chars unreserved).
+    assert client._parse_repo("owner/repo") == ("owner", "repo")
+    # A path-traversal attempt has its slashes encoded, so it can't open new
+    # REST path segments (the security property; '.' is unreserved so '..'
+    # itself stays literal but is inert without a raw '/').
+    owner, name = client._parse_repo("owner/repo/../../secret")
+    assert owner == "owner"
+    assert "/" not in name
+    assert name == "repo%2F..%2F..%2Fsecret"
+    # Dot-only segments (which httpx would collapse into path traversal) are
+    # rejected outright, not encoded.
+    for bad in ("../meta", "owner/..", "./x", "owner/.", "owner/"):
+        with pytest.raises(GitHubClientError):
+            client._parse_repo(bad)
