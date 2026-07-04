@@ -112,11 +112,26 @@ class GitHubClient:
             self._client = None
 
     def _parse_repo(self, repo: str) -> tuple[str, str]:
-        """Parse owner/repo string."""
+        """Parse and URL-encode an ``owner/repo`` string.
+
+        The segments are only ever interpolated into REST paths, so encode them
+        (``safe=""`` also encodes ``/``): a crafted repo containing ``/``,
+        ``..``, or query/fragment characters can't inject into or traverse the
+        API path (F348). Legit ``owner/repo`` characters are all unreserved, so
+        they pass through unchanged.
+        """
         if "/" not in repo:
             raise GitHubClientError(f"Invalid repo format: {repo}. Expected 'owner/repo'.")
-        parts = repo.split("/", 1)
-        return parts[0], parts[1]
+        owner, repo_name = repo.split("/", 1)
+        # Reject empty or dot-only segments: '.'/'..' are unreserved so ``quote``
+        # leaves them intact and httpx collapses them in the path, which would
+        # still allow REST traversal (e.g. '../meta', 'owner/..').
+        for seg in (owner, repo_name):
+            if seg in ("", ".", ".."):
+                raise GitHubClientError(
+                    f"Invalid repo format: {repo}. Expected 'owner/repo'."
+                )
+        return quote(owner, safe=""), quote(repo_name, safe="")
 
     async def get_file_content(
         self,
