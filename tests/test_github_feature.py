@@ -331,7 +331,7 @@ class TestGitHubFeature:
 
         result = await feature.read_github_file(repo="self", path="test.py")
 
-        assert "cached content" in result.confirmation
+        assert result.data["content"] == "cached content"
         assert result.data["cached"] is True
 
     @pytest.mark.asyncio

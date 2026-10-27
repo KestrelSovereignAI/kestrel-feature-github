@@ -5,12 +5,14 @@
 ## Skills
 
 ### read_github_file
-- **Description**: Read a file from a GitHub repository
+- **Description**: Read a file from a GitHub repository, in chunks sized to fit the tool-result cap. Each chunk reports `offset`, `returned_chars`, `total_chars` and `next_offset` (null at the end of the file); call again with `offset` set to `next_offset` to read the rest
 - **Category**: data_access
 - **Parameters**:
   - `repo` (string, required): Repository in 'owner/repo' format, or 'self'
   - `path` (string, required): Path to file within the repository
   - `ref` (string, optional): Branch, tag, or commit SHA (default: main)
+  - `offset` (integer, optional): Character offset to start reading from (default 0); an offset past the end returns an empty chunk
+  - `limit` (integer, optional): Max characters to return; shrunk further to fit the tool-result cap (default: as many as fit)
 
 ### list_github_files
 - **Description**: List files in a GitHub repository directory
