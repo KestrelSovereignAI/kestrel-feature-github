@@ -16,6 +16,7 @@ from .ast_analyzer import ASTAnalyzer
 from .cache import GitHubCache
 from .client import GitHubClient, GitHubClientError
 from .models import ComponentManifest, FileType
+from .paging import PageRequestError, paged_text_result, validate_page
 from .stale_work import classify_stale_work
 from .stalled_sweep_source import (
     SOURCE_NAME as STALLED_SWEEP_SOURCE_NAME,
@@ -175,7 +176,14 @@ class GitHubFeature(Feature):
 
     @tool(
         name="read_github_file",
-        description="Read a file from a GitHub repository. Use 'self' as repo to read from the agent's own codebase.",
+        description=(
+            "Read a file from a GitHub repository. Use 'self' as repo to read from "
+            "the agent's own codebase. Large files are returned in chunks sized to "
+            "fit the tool-result cap, starting at offset (characters, default 0); "
+            "limit caps the chunk. Each chunk reports offset, returned_chars, "
+            "total_chars and next_offset (null at the end of the file) — call "
+            "again with offset set to next_offset to read the rest."
+        ),
         category=ToolCategory.DATA_ACCESS,
     )
     async def read_github_file(
@@ -183,40 +191,59 @@ class GitHubFeature(Feature):
         repo: str,
         path: str,
         ref: str = "main",
+        offset: int = 0,
+        # Not Optional[int]: SDKs before 0.29 advertise Optional[int] to the
+        # model as a string. A None default on int is an integer that accepts
+        # null on every SDK this package supports.
+        limit: int = None,
     ) -> ToolResult:
-        """Read a file from GitHub.
+        """Read a file from GitHub, one chunk per call.
 
         Args:
             repo: Repository in 'owner/repo' format, or 'self' for agent's codebase
             path: Path to file within the repository
             ref: Branch, tag, or commit SHA (default: main)
+            offset: Character offset to start reading from (default 0)
+            limit: Max characters to return; shrunk further so the result fits the tool-result cap. Defaults to as many as fit.
 
         Returns:
-            File content with path header
+            The chunk in ``data.content`` with its offset, returned_chars,
+            total_chars and next_offset (None at the end of the file)
         """
+        try:
+            validate_page(offset, limit)
+        except PageRequestError as e:
+            return ToolResult.failed(error=f"Error reading {path}: {e}")
+
         repo = self._resolve_repo(repo)
         if ref == "main":
             ref = GITHUB_DEFAULT_BRANCH
 
         # Check cache first
-        cached = await self.cache.get(repo, path, ref)
-        if cached:
-            return ToolResult.ok(
-                f"# {path} (cached)\n\n{cached.content}",
-                data={"repo": repo, "path": path, "ref": ref, "cached": True},
-            )
-
-        # Fetch from GitHub
-        try:
-            content = await self.client.get_file_content(repo, path, ref)
-            # Cache it
+        content = await self.cache.get(repo, path, ref)
+        cached = content is not None
+        if not cached:
+            # Fetch from GitHub
+            try:
+                content = await self.client.get_file_content(repo, path, ref)
+            except GitHubClientError as e:
+                return ToolResult.failed(error=f"Error reading {path}: {e}")
             await self.cache.set(content)
-            return ToolResult.ok(
-                f"# {path}\n\n{content.content}",
-                data={"repo": repo, "path": path, "ref": ref, "cached": False},
-            )
-        except GitHubClientError as e:
-            return ToolResult.failed(error=f"Error reading {path}: {e}")
+
+        return paged_text_result(
+            content.content,
+            offset=offset,
+            limit=limit,
+            tool_name="read_github_file",
+            subject=f"{path} at {ref}",
+            data={
+                "repo": repo,
+                "path": path,
+                "ref": ref,
+                "sha": content.sha,
+                "cached": cached,
+            },
+        )
 
     @tool(
         name="list_github_files",
